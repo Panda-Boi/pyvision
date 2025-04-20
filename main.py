@@ -1,102 +1,168 @@
+import time
+from typing import List, Tuple, Iterator
+from dataclasses import dataclass
+
 import cv2
+import torch
+import numpy as np
 from ultralytics import YOLO
-import os, random
+from tqdm import tqdm
 
-# === Input video file path ===
-INPUT_VIDEO_PATH = "input.mp4"  # Replace with your video path
 
-# Check if the input file exists
-if not os.path.isfile(INPUT_VIDEO_PATH):
-    raise FileNotFoundError(f"Input video file not found: {INPUT_VIDEO_PATH}")
+@dataclass
+class DetectionConfig:
+    input_path: str
+    output_path: str
+    frame_limit: int = 1000
+    batch_size: int = 8
+    person_confidence: float = 0.5
+    helmet_confidence: float = 0.5
+    base_model: str = 'yolov8n.pt'
+    helmet_model: str = 'best.pt'
 
-# === Load YOLOv8 model ===
-model = YOLO("yolov8n.pt")  # Swap to yolov8s.pt, yolov8m.pt, etc., for better accuracy
 
-# === Open video file ===
-cap = cv2.VideoCapture(INPUT_VIDEO_PATH)
+class BaseDetectionModel:
+    def __init__(self, config: DetectionConfig):
+        self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        self.model = YOLO(config.base_model).to(self.device)
 
-width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    def detect(self, frames: List[np.ndarray]):
+        return self.model(frames, stream=False, verbose=False)
 
-OUTPUT_VIDEO_PATH = f"output.mp4"
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-out = cv2.VideoWriter(OUTPUT_VIDEO_PATH, fourcc, fps, (width, height))
 
-print(f"Processing input: {INPUT_VIDEO_PATH}")
-print(f"Saving processed video to: {OUTPUT_VIDEO_PATH}")
+class HelmetDetectionModel:
+    def __init__(self, config: DetectionConfig):
+        self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        self.model = YOLO(config.helmet_model).to(self.device)
 
-def is_uniform(person_image) -> bool:
-    return 'Wearing Uniform' if (random.randint(0, 1)) else 'Not wearing uniform'
+    def detect(self, image: np.ndarray) -> bool:
+        result = self.model.predict(image, stream=False, verbose=False)[0]
+        return any(int(b.cls[0]) == 0 and float(b.conf[0]) > 0.5 for b in result.boxes)
 
-def is_working(person_image) -> bool:
-    return 'Working' if (random.randint(0, 1)) else 'Idle'
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+class Visualizer:
+    @staticmethod
+    def draw_detections(frame: np.ndarray, box: Tuple[int, int, int, int], has_helmet: bool, confidence: float):
+        x1, y1, x2, y2 = box
+        color = (0, 255, 0) if has_helmet else (0, 0, 255)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        label = 'Helmet' if has_helmet else 'No Helmet'
+        cv2.putText(frame, f'{label} {confidence:.2f}', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-    results = model(frame)[0]
+    @staticmethod
+    def draw_person_count(frame: np.ndarray, count: int):
+        cv2.putText(frame, f'People: {count}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
 
-    person_count = 0
-    person_shown = False
 
-    for box in results.boxes:
-        cls_id = int(box.cls[0])
-        conf = float(box.conf[0])
-        if model.names[cls_id] == 'person':
-            person_count += 1
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            label = f'Person {conf:.2f}'
+class VideoProcessor:
+    def __init__(self, config: DetectionConfig):
+        self.config = config
+        self.cap = cv2.VideoCapture(config.input_path)
+        if not self.cap.isOpened():
+            raise FileNotFoundError(f'Could not open video file: {config.input_path}')
 
-            person_crop = frame[y1:y2, x1:x2]
+        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.out = cv2.VideoWriter(config.output_path, cv2.VideoWriter_fourcc(*'mp4v'), self.fps, (self.width, self.height))
 
-            # showing 1 persons video stream
-            if not person_shown:
-                cv2.imshow("Cropped Person", person_crop)
-                person_shown = True
+    def __enter__(self):
+        return self
 
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(
-                img=frame, 
-                text=label, 
-                org=(x1, y1 + 20), 
-                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                fontScale=0.5, 
-                color=(0, 0, 0), 
-                thickness=2
-            )
-            cv2.putText(
-                img=frame, 
-                text=is_uniform(person_crop), 
-                org=(x1, y1 + 35), 
-                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                fontScale=0.5, 
-                color=(0, 0, 0), 
-                thickness=2
-            )
-            cv2.putText(
-                img=frame, 
-                text=is_working(person_crop), 
-                org=(x1, y1 + 50), 
-                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                fontScale=0.5, 
-                color=(0, 0, 0), 
-                thickness=2
-            )
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
 
-    count_label = f'People detected: {person_count}'
-    cv2.putText(frame, count_label, (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+    def release(self):
+        self.cap.release()
+        self.out.release()
+        cv2.destroyAllWindows()
 
-    # cv2.imshow('Workplace Analysis', frame)
-    out.write(frame)
+    def read_batches(self) -> Iterator[List[np.ndarray]]:
+        frame_count = 0
+        batch_frames = []
 
-    if cv2.waitKey(1) == 27:  # ESC to exit early
-        break
+        with tqdm(total=min(self.total_frames, self.config.frame_limit), desc='Processing frames') as pbar:
+            while True:
+                ret, frame = self.cap.read()
+                if not ret or frame_count >= self.config.frame_limit:
+                    if batch_frames:
+                        yield batch_frames
+                        pbar.update(len(batch_frames))
+                    break
 
-# Cleanup
-cap.release()
-out.release()
-cv2.destroyAllWindows()
+                batch_frames.append(frame)
+                frame_count += 1
+
+                if len(batch_frames) >= self.config.batch_size:
+                    yield batch_frames
+                    pbar.update(len(batch_frames))
+                    batch_frames = []
+        print()
+
+
+class DetectionSystem:
+    def __init__(self, config: DetectionConfig):
+        self.config = config
+        self.person_model = BaseDetectionModel(config)
+        self.helmet_model = HelmetDetectionModel(config)
+        self.visualizer = Visualizer()
+
+    def process_video(self):
+        print(f'Device: {"cuda" if torch.cuda.is_available() else "cpu"}\n'
+              f'Input: {self.config.input_path}\n'
+              f'Output: {self.config.output_path}')
+
+        start_time = time.time()
+        frame_count = 0
+
+        with VideoProcessor(self.config) as processor:
+            for batch in processor.read_batches():
+                frame_count += len(batch)
+                self._process_batch(batch, processor)
+
+        total_time = time.time() - start_time
+        fps = frame_count / total_time if total_time > 0 else 0
+        print(f'FPS: {fps:.2f}')
+
+    def _process_batch(self, batch: List[np.ndarray], processor: VideoProcessor):
+        results = self.person_model.detect(batch)
+
+        for frame, result in zip(batch, results):
+            person_count = 0
+
+            for box in result.boxes:
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+
+                if cls_id != 0 or conf < self.config.person_confidence:
+                    continue
+
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                person_count += 1
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(processor.width, x2), min(processor.height, y2)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                crop = frame[y1:y2, x1:x2]
+                has_helmet = self.helmet_model.detect(crop)
+                self.visualizer.draw_detections(frame, (x1, y1, x2, y2), has_helmet, conf)
+
+            self.visualizer.draw_person_count(frame, person_count)
+            processor.out.write(frame)
+
+
+config = DetectionConfig(
+    input_path='input.mp4',
+    output_path='output.mp4',
+    batch_size=16,
+    person_confidence=0.5,
+    helmet_confidence=0.7,
+    base_model='yolov8n.pt',
+    helmet_model='s640.pt'
+)
+
+if __name__ == '__main__':
+    system = DetectionSystem(config)
+    system.process_video()
