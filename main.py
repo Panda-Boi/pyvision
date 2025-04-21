@@ -9,6 +9,7 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 from tqdm import tqdm
 from ultralytics import YOLO
 
+import pose
 
 @dataclass
 class DetectionConfig:
@@ -105,6 +106,7 @@ class VideoProcessor:
 
                 batch_frames.append(frame)
 
+                # only process every 3rd frame
                 if frame_count % 3 == 0:
                     process_indices.append(len(batch_frames) - 1)
 
@@ -156,6 +158,8 @@ class DetectionSystem:
         print(f'FPS: {fps:.2f}')
 
     def _process_batch(self, batch: List[np.ndarray], process_indices: List[int], processor: VideoProcessor):
+        print(f'Processing {process_indices} indices out of batch of len {len(batch)}')
+
         results = self.person_model.detect([batch[i] for i in process_indices])
         person_boxes_per_index = {}
         crops = []
@@ -202,8 +206,42 @@ class DetectionSystem:
                 helmet_per_person[frame_idx] = {}
             helmet_per_person[frame_idx][track_id] = (box, has_helmet)
 
+        # interpolation
+        interpolated_detections = self.interpolate_frames(batch, helmet_per_person)
+
+        # visualization
+        prev_detection = {}
+        prev_keypoints = {}
+        for i, frame in enumerate(batch):
+            detections = interpolated_detections.get(i, prev_detection)
+            person_count = len(detections)
+
+            for track_id, (box, has_helmet) in detections.items():
+                x1, y1, x2, y2 = box
+                self.visualizer.draw_detections(frame, box, has_helmet)
+
+                person_crop = frame[y1:y2, x1:x2]
+
+                try:
+                    keypoints = pose.detect_pose(person_crop)
+                except:
+                    print(track_id)
+                    print(person_crop.shape)
+                    continue
+
+                pose.draw_skeleton(person_crop, keypoints)
+                
+                state = 'Idle' if pose.is_idle(keypoints, prev_keypoints.get(track_id, np.empty(1, dtype=int))) else 'Working'
+                prev_keypoints[track_id] = keypoints
+
+                cv2.putText(frame, f'ID: {track_id} | {state}', (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+            prev_detection = detections
+            self.visualizer.draw_person_count(frame, person_count)
+            processor.out.write(frame)
+
+    def interpolate_frames(self, batch, helmet_per_person):
         track_history = {}
-        
         for frame_idx, detections in helmet_per_person.items():
             for track_id, (box, has_helmet) in detections.items():
                 if track_id not in track_history:
@@ -262,18 +300,8 @@ class DetectionSystem:
                             interpolated_detections[i][track_id] = frame_data[prev_frame]
                     else:
                         interpolated_detections[i][track_id] = frame_data[prev_frame]
-
-        for i, frame in enumerate(batch):
-            detections = interpolated_detections.get(i, {})
-            person_count = len(detections)
-
-            for track_id, (box, has_helmet) in detections.items():
-                x1, y1, x2, y2 = box
-                self.visualizer.draw_detections(frame, box, has_helmet)
-                cv2.putText(frame, f'ID: {track_id}', (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-
-            self.visualizer.draw_person_count(frame, person_count)
-            processor.out.write(frame)
+            
+        return interpolated_detections
 
 
 config = DetectionConfig(
