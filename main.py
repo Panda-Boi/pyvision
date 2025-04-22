@@ -1,4 +1,4 @@
-import time
+import time, json
 from typing import List, Tuple, Iterator, Dict
 from dataclasses import dataclass
 
@@ -24,6 +24,7 @@ class DetectionConfig:
     deepsort_max_age: int = 30
     deepsort_n_init: int = 5
     deepsort_confidence: float = 0.5
+    debug: bool = False
 
 
 class BaseDetectionModel:
@@ -117,129 +118,12 @@ class VideoProcessor:
                     pbar.update(len(batch_frames))
                     batch_frames = []
                     process_indices = []
+                    # ensure that the first and last frame are always processed
+                    frame_count = 0
         print()
 
 
-def interpolate_box(box1: Tuple[int, int, int, int], box2: Tuple[int, int, int, int], factor: float) -> Tuple[int, int, int, int]:
-    x1_1, y1_1, x2_1, y2_1 = box1
-    x1_2, y1_2, x2_2, y2_2 = box2
-    
-    x1 = int(x1_1 + factor * (x1_2 - x1_1))
-    y1 = int(y1_1 + factor * (y1_2 - y1_1))
-    x2 = int(x2_1 + factor * (x2_2 - x2_1))
-    y2 = int(y2_1 + factor * (y2_2 - y2_1))
-    
-    return (x1, y1, x2, y2)
-
-
-class DetectionSystem:
-    def __init__(self, config: DetectionConfig):
-        self.config = config
-        self.person_model = BaseDetectionModel(config)
-        self.helmet_model = HelmetDetectionModel(config)
-        self.tracker = DeepSortTracker(config).tracker
-        self.visualizer = Visualizer()
-
-    def process_video(self):
-        print(f'Device: {"cuda" if torch.cuda.is_available() else "cpu"}\n'
-              f'Input: {self.config.input_path}\n'
-              f'Output: {self.config.output_path}')
-
-        start_time = time.time()
-        frame_count = 0
-
-        with VideoProcessor(self.config) as processor:
-            for batch, process_indices in processor.read_batches():
-                frame_count += len(batch)
-                self._process_batch(batch, process_indices, processor)
-
-        total_time = time.time() - start_time
-        fps = frame_count / total_time if total_time > 0 else 0
-        print(f'FPS: {fps:.2f}')
-
-    def _process_batch(self, batch: List[np.ndarray], process_indices: List[int], processor: VideoProcessor):
-        print(f'Processing {process_indices} indices out of batch of len {len(batch)}')
-
-        results = self.person_model.detect([batch[i] for i in process_indices])
-        person_boxes_per_index = {}
-        crops = []
-        crop_meta = []
-
-        for idx, (frame_idx, result) in enumerate(zip(process_indices, results)):
-            detections = []
-            for box in result.boxes:
-                cls_id = int(box.cls[0])
-                conf = float(box.conf[0])
-                if cls_id == 0 and conf >= self.config.person_confidence:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    bbox = [x1, y1, x2 - x1, y2 - y1]
-                    detections.append((bbox, conf, 'person'))
-            person_boxes_per_index[frame_idx] = detections
-
-        tracks_per_index = {}
-        for i in process_indices:
-            tracks = self.tracker.update_tracks(person_boxes_per_index[i], frame=batch[i])
-            track_meta = []
-            for track in tracks:
-                if not track.is_confirmed():
-                    continue
-                track_id = track.track_id
-                x1, y1, x2, y2 = map(int, track.to_ltrb())
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(processor.width, x2), min(processor.height, y2)
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                crop = batch[i][y1:y2, x1:x2]
-                crops.append(crop)
-                crop_meta.append((i, track_id, (x1, y1, x2, y2)))
-                track_meta.append((track_id, (x1, y1, x2, y2)))
-            tracks_per_index[i] = track_meta
-
-        helmet_results = self.helmet_model.model(crops, stream=False, verbose=False)
-        helmet_flags = []
-        for result in helmet_results:
-            helmet_flags.append(any(int(b.cls[0]) == 0 and float(b.conf[0]) > self.config.helmet_confidence for b in result.boxes))
-
-        helmet_per_person = {}
-        for (frame_idx, track_id, box), has_helmet in zip(crop_meta, helmet_flags):
-            if frame_idx not in helmet_per_person:
-                helmet_per_person[frame_idx] = {}
-            helmet_per_person[frame_idx][track_id] = (box, has_helmet)
-
-        # interpolation
-        interpolated_detections = self.interpolate_frames(batch, helmet_per_person)
-
-        # visualization
-        prev_detection = {}
-        prev_keypoints = {}
-        for i, frame in enumerate(batch):
-            detections = interpolated_detections.get(i, prev_detection)
-            person_count = len(detections)
-
-            for track_id, (box, has_helmet) in detections.items():
-                x1, y1, x2, y2 = box
-                self.visualizer.draw_detections(frame, box, has_helmet)
-
-                person_crop = frame[y1:y2, x1:x2]
-
-                try:
-                    keypoints = pose.detect_pose(person_crop)
-                except:
-                    print(track_id)
-                    print(person_crop.shape)
-                    continue
-
-                pose.draw_skeleton(person_crop, keypoints)
-                
-                state = 'Idle' if pose.is_idle(keypoints, prev_keypoints.get(track_id, np.empty(1, dtype=int))) else 'Working'
-                prev_keypoints[track_id] = keypoints
-
-                cv2.putText(frame, f'ID: {track_id} | {state}', (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-
-            prev_detection = detections
-            self.visualizer.draw_person_count(frame, person_count)
-            processor.out.write(frame)
-
+class Interpolator:
     def interpolate_frames(self, batch, helmet_per_person):
         track_history = {}
         for frame_idx, detections in helmet_per_person.items():
@@ -275,7 +159,7 @@ class DetectionSystem:
                     current_pos = i - prev_frame
                     factor = current_pos / total_gap if total_gap > 0 else 0
                     
-                    interpolated_box = interpolate_box(prev_box, next_box, factor)
+                    interpolated_box = self._interpolate_box(prev_box, next_box, factor)
                     
                     nearest_helmet = prev_helmet if (i - prev_frame < next_frame - i) else next_helmet
                     
@@ -292,7 +176,7 @@ class DetectionSystem:
                             frame_diff = prev_frame - prev_prev_frame
                             if frame_diff > 0:
                                 factor = (i - prev_frame) / frame_diff
-                                predicted_box = interpolate_box(prev_prev_box, prev_box, 1 + factor)
+                                predicted_box = self._interpolate_box(prev_prev_box, prev_box, 1 + factor)
                                 interpolated_detections[i][track_id] = (predicted_box, prev_helmet)
                             else:
                                 interpolated_detections[i][track_id] = (prev_box, prev_helmet)
@@ -302,6 +186,149 @@ class DetectionSystem:
                         interpolated_detections[i][track_id] = frame_data[prev_frame]
             
         return interpolated_detections
+    
+    def _interpolate_box(self, box1: Tuple[int, int, int, int], box2: Tuple[int, int, int, int], factor: float) -> Tuple[int, int, int, int]:
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+        
+        x1 = int(x1_1 + factor * (x1_2 - x1_1))
+        y1 = int(y1_1 + factor * (y1_2 - y1_1))
+        x2 = int(x2_1 + factor * (x2_2 - x2_1))
+        y2 = int(y2_1 + factor * (y2_2 - y2_1))
+        
+        return (x1, y1, x2, y2)
+
+
+class DetectionSystem:
+    def __init__(self, config: DetectionConfig):
+        self.config = config
+        self.person_model = BaseDetectionModel(config)
+        self.helmet_model = HelmetDetectionModel(config)
+        self.tracker = DeepSortTracker(config).tracker
+        self.visualizer = Visualizer()
+        self.interpolater = Interpolator()
+        self.frames = {}
+
+    def process_video(self):
+        print(f'Device: {"cuda" if torch.cuda.is_available() else "cpu"}\n'
+              f'Input: {self.config.input_path}\n'
+              f'Output: {self.config.output_path}')
+
+        start_time = time.time()
+        frame_count = 0
+
+        with VideoProcessor(self.config) as processor:
+            for batch, process_indices in processor.read_batches():
+                frame_count += len(batch)
+                self._process_batch(batch, process_indices, processor)
+
+        total_time = time.time() - start_time
+        fps = frame_count / total_time if total_time > 0 else 0
+        print(f'FPS: {fps:.2f}')
+
+    def _process_batch(self, batch: List[np.ndarray], process_indices: List[int], processor: VideoProcessor):
+        print(f'Processing {process_indices} indices out of batch of len {len(batch)}')
+
+        # get raw segmented detections
+        results = self.person_model.detect([batch[i] for i in process_indices])
+        person_boxes_per_index = {}
+        crops = []
+        crop_meta = []
+
+        for idx, (frame_idx, result) in enumerate(zip(process_indices, results)):
+            detections = []
+            for box in result.boxes:
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                if cls_id == 0 and conf >= self.config.person_confidence:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    bbox = [x1, y1, x2 - x1, y2 - y1]
+                    detections.append((bbox, conf, 'person'))
+            person_boxes_per_index[frame_idx] = detections
+
+        if self.config.debug:
+            print('============Raw Detections============')
+            print(person_boxes_per_index)     
+
+        # get tracked detections
+        tracks_per_index = {}
+        for i in process_indices:
+            tracks = self.tracker.update_tracks(person_boxes_per_index[i], frame=batch[i])
+            track_meta = []
+            for track in tracks:
+                if not track.is_confirmed():
+                    continue
+                track_id = track.track_id
+                x1, y1, x2, y2 = map(int, track.to_ltrb())
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(processor.width, x2), min(processor.height, y2)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                crop = batch[i][y1:y2, x1:x2]
+                crops.append(crop)
+                crop_meta.append((i, track_id, (x1, y1, x2, y2)))
+                track_meta.append((track_id, (x1, y1, x2, y2)))
+            tracks_per_index[i] = track_meta
+
+        if self.config.debug:
+            print('============Tracked Detections============')
+            print(tracks_per_index)
+
+        # get helmet results
+        helmet_results = self.helmet_model.model(crops, stream=False, verbose=False)
+        helmet_flags = []
+        for result in helmet_results:
+            helmet_flags.append(any(int(b.cls[0]) == 0 and float(b.conf[0]) > self.config.helmet_confidence for b in result.boxes))
+
+        # combine person segments and helmet results
+        helmet_per_person = {}
+        for (frame_idx, track_id, box), has_helmet in zip(crop_meta, helmet_flags):
+            if frame_idx not in helmet_per_person:
+                helmet_per_person[frame_idx] = {}
+            helmet_per_person[frame_idx][track_id] = (box, has_helmet)
+
+        if self.config.debug:
+            print('============Processed Frames============')
+            print(helmet_per_person)
+
+        # interpolation
+        interpolated_detections = self.interpolater.interpolate_frames(batch, helmet_per_person)
+
+        if self.config.debug:
+            print('============Interpolated Frames============')
+            print(interpolated_detections)
+
+        # visualization
+        prev_keypoints = {}
+        prev_states = {}
+        for i, frame in enumerate(batch):
+            detections = interpolated_detections.get(i, {})
+            person_count = len(detections)
+
+            for track_id, (box, has_helmet) in detections.items():
+                x1, y1, x2, y2 = box
+                self.visualizer.draw_detections(frame, box, has_helmet)
+
+                # pose detection
+                person_crop = frame[y1:y2, x1:x2]
+                try:
+                    keypoints = pose.detect_pose(person_crop)
+                except:
+                    if self.config.debug:
+                        print(f'Failed to detect pose\nTrack ID:{track_id} | Person Crop Shape: {person_crop.shape}')
+                    continue
+
+                if self.config.debug:
+                    pose.draw_skeleton(person_crop, keypoints)
+                
+                state = pose.state(keypoints, prev_keypoints.get(track_id, np.empty(1, dtype=int)), prev_states.get(track_id, 'Idle'))
+                prev_keypoints[track_id] = keypoints
+                prev_states[track_id] = state
+
+                cv2.putText(frame, f'ID: {track_id} | {state}', (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+            self.visualizer.draw_person_count(frame, person_count)
+            processor.out.write(frame)
 
 
 config = DetectionConfig(
@@ -314,7 +341,8 @@ config = DetectionConfig(
     helmet_model='s640.pt',
     deepsort_max_age=90,
     deepsort_n_init=10,
-    deepsort_confidence=0.6
+    deepsort_confidence=0.6,
+    debug=True,
 )
 
 if __name__ == '__main__':

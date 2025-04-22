@@ -6,6 +6,18 @@ import tensorflow_hub as hub
 tf_model = hub.load("https://tfhub.dev/google/movenet/singlepose/lightning/4")
 movenet = tf_model.signatures['serving_default']
 
+def state(keypoints_now, keypoints_prev, prev_state):
+
+    KEYPOINTS_THRESHOLD = 10
+
+    if len(keypoints_now) < KEYPOINTS_THRESHOLD:
+        return prev_state
+
+    if is_idle(keypoints_now, keypoints_prev):
+        return 'Idle'
+    else:
+        return 'Working'
+
 def is_idle(keypoints_now, keypoints_prev, movement_threshold=0.1):
     if not keypoints_prev.all():
         return True
