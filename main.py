@@ -1,4 +1,4 @@
-import time, json
+import time
 from typing import List, Tuple, Iterator, Dict
 from dataclasses import dataclass
 
@@ -9,7 +9,8 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 from tqdm import tqdm
 from ultralytics import YOLO
 
-import pose
+import tensorflow as tf
+import tensorflow_hub as hub
 
 @dataclass
 class DetectionConfig:
@@ -52,6 +53,88 @@ class DeepSortTracker:
         self.n_init = config.deepsort_n_init
         self.min_confidence = config.deepsort_confidence
         self.tracker = DeepSort(self.max_age, self.n_init, self.min_confidence)
+
+class PoseDetectionModel:
+    def __init__(self):
+        self.tf_model = hub.load("https://tfhub.dev/google/movenet/singlepose/lightning/4")
+        self.movenet = self.tf_model.signatures['serving_default']
+
+    def state(self, keypoints_now, keypoints_prev, prev_state):
+
+        KEYPOINTS_THRESHOLD = 10
+
+        if len(keypoints_now) < KEYPOINTS_THRESHOLD:
+            return prev_state
+
+        if self._is_idle(keypoints_now, keypoints_prev):
+            return 'Idle'
+        else:
+            return 'Working'
+
+    def _is_idle(self, keypoints_now, keypoints_prev, movement_threshold=0.1):
+        if not keypoints_prev.all():
+            return True
+
+        diffs = np.linalg.norm(keypoints_now[:, :2] - keypoints_prev[:, :2], axis=1)
+        avg_motion = np.mean(diffs)
+        return avg_motion < movement_threshold
+
+    def detect_pose(self, frame: np.ndarray, target_size=192) -> np.ndarray:
+        img = tf.image.resize_with_pad(tf.expand_dims(frame, axis=0), target_size, target_size)
+        input_img = tf.cast(img, dtype=tf.int32)
+
+        # Run detection
+        outputs = self.movenet(input_img)
+        keypoints = outputs['output_0'].numpy()[0, 0, :, :]  # 17 keypoints
+        
+        # map keypoints to original image
+        keypoints = self._get_keypoints_on_original_image(keypoints, frame.shape, target_size)
+        return keypoints
+
+    def _get_keypoints_on_original_image(self, keypoints: np.ndarray, original_shape, target_size=192) -> np.ndarray:
+        h, w = original_shape[0], original_shape[1]
+
+        # Compute scale factor and padding used in resize_with_pad
+        scale = min(target_size / w, target_size / h)
+        new_width = scale * w
+        new_height = scale * h
+        pad_x = (target_size - new_width) / 2
+        pad_y = (target_size - new_height) / 2
+
+        mapped = []
+        for y, x, conf in keypoints:
+            # Convert from normalized [0,1] coordinates in padded image
+            x_px = ((x * target_size - pad_x) / w) / scale
+            y_px = ((y * target_size - pad_y) / h)/ scale
+            mapped.append([y_px, x_px, conf])
+
+        return np.array(mapped)
+
+    def draw_skeleton(self, frame, keypoints, threshold=0.3):
+        h, w, _ = frame.shape
+        # Define skeleton connections
+        edges = {
+            (0, 1), (0, 2), (1, 3), (2, 4),
+            (0, 5), (0, 6), (5, 7), (7, 9),
+            (6, 8), (8, 10), (5, 6),
+            (5, 11), (6, 12), (11, 12),
+            (11, 13), (13, 15), (12, 14), (14, 16)
+        }
+
+        # Draw keypoints
+        for kp in keypoints:
+            y, x, confidence = kp
+            if confidence > threshold:
+                cv2.circle(frame, (int(x * w), int(y * h)), 5, (0, 255, 0), -1)
+
+        # Draw skeleton edges
+        for p1, p2 in edges:
+            y1, x1, c1 = keypoints[p1]
+            y2, x2, c2 = keypoints[p2]
+            if c1 > threshold and c2 > threshold:
+                x1_px, y1_px = int(x1 * w), int(y1 * h)
+                x2_px, y2_px = int(x2 * w), int(y2 * h)
+                cv2.line(frame, (x1_px, y1_px), (x2_px, y2_px), (255, 0, 0), 2)
 
 
 class Visualizer:
@@ -205,6 +288,7 @@ class DetectionSystem:
         self.person_model = BaseDetectionModel(config)
         self.helmet_model = HelmetDetectionModel(config)
         self.tracker = DeepSortTracker(config).tracker
+        self.pose_model = PoseDetectionModel()
         self.visualizer = Visualizer()
         self.interpolater = Interpolator()
         self.frames = {}
@@ -312,16 +396,16 @@ class DetectionSystem:
                 # pose detection
                 person_crop = frame[y1:y2, x1:x2]
                 try:
-                    keypoints = pose.detect_pose(person_crop)
+                    keypoints = self.pose_model.detect_pose(person_crop)
                 except:
                     if self.config.debug:
                         print(f'Failed to detect pose\nTrack ID:{track_id} | Person Crop Shape: {person_crop.shape}')
                     continue
 
                 if self.config.debug:
-                    pose.draw_skeleton(person_crop, keypoints)
+                    self.pose_model.draw_skeleton(person_crop, keypoints)
                 
-                state = pose.state(keypoints, prev_keypoints.get(track_id, np.empty(1, dtype=int)), prev_states.get(track_id, 'Idle'))
+                state = self.pose_model.state(keypoints, prev_keypoints.get(track_id, np.empty(1, dtype=int)), prev_states.get(track_id, 'Idle'))
                 prev_keypoints[track_id] = keypoints
                 prev_states[track_id] = state
 
