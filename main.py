@@ -3,7 +3,6 @@ from typing import List, Tuple, Iterator, Dict
 from dataclasses import dataclass
 
 import cv2
-import torch
 import numpy as np
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from tqdm import tqdm
@@ -11,6 +10,7 @@ from ultralytics import YOLO
 
 import tensorflow as tf
 import tensorflow_hub as hub
+
 
 @dataclass
 class DetectionConfig:
@@ -30,20 +30,18 @@ class DetectionConfig:
 
 class BaseDetectionModel:
     def __init__(self, config: DetectionConfig):
-        self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-        self.model = YOLO(config.base_model).to(self.device)
+        self.model = YOLO(config.base_model)
 
     def detect(self, frames: List[np.ndarray]):
-        return self.model(frames, stream=False, verbose=False)
+        return self.model(frames, stream=False, verbose=False, device='0')
 
 
 class HelmetDetectionModel:
     def __init__(self, config: DetectionConfig):
-        self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-        self.model = YOLO(config.helmet_model).to(self.device)
+        self.model = YOLO(config.helmet_model)
 
     def detect(self, image: np.ndarray) -> bool:
-        result = self.model.predict(image, stream=False, verbose=False)[0]
+        result = self.model(image, stream=False, verbose=False, device='0')[0]
         return any(int(b.cls[0]) == 0 and float(b.conf[0]) > config.helmet_confidence for b in result.boxes)
 
 
@@ -53,6 +51,7 @@ class DeepSortTracker:
         self.n_init = config.deepsort_n_init
         self.min_confidence = config.deepsort_confidence
         self.tracker = DeepSort(self.max_age, self.n_init, self.min_confidence)
+
 
 class PoseDetectionModel:
     def __init__(self):
@@ -86,7 +85,7 @@ class PoseDetectionModel:
         # Run detection
         outputs = self.movenet(input_img)
         keypoints = outputs['output_0'].numpy()[0, 0, :, :]  # 17 keypoints
-        
+
         # map keypoints to original image
         keypoints = self._get_keypoints_on_original_image(keypoints, frame.shape, target_size)
         return keypoints
@@ -105,7 +104,7 @@ class PoseDetectionModel:
         for y, x, conf in keypoints:
             # Convert from normalized [0,1] coordinates in padded image
             x_px = ((x * target_size - pad_x) / w) / scale
-            y_px = ((y * target_size - pad_y) / h)/ scale
+            y_px = ((y * target_size - pad_y) / h) / scale
             mapped.append([y_px, x_px, conf])
 
         return np.array(mapped)
@@ -161,7 +160,8 @@ class VideoProcessor:
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.out = cv2.VideoWriter(config.output_path, cv2.VideoWriter_fourcc(*'mp4v'), self.fps, (self.width, self.height))
+        self.out = cv2.VideoWriter(config.output_path, cv2.VideoWriter_fourcc(*'mp4v'), self.fps,
+                                   (self.width, self.height))
 
     def __enter__(self):
         return self
@@ -214,40 +214,40 @@ class Interpolator:
                 if track_id not in track_history:
                     track_history[track_id] = {}
                 track_history[track_id][frame_idx] = (box, has_helmet)
-        
+
         interpolated_detections = {}
         for i in range(len(batch)):
             interpolated_detections[i] = {}
-            
+
             if i in helmet_per_person:
                 interpolated_detections[i] = helmet_per_person[i]
                 continue
-                
+
             for track_id, frame_data in track_history.items():
                 prev_frame = None
                 next_frame = None
-                
+
                 for proc_idx in sorted(frame_data.keys()):
                     if proc_idx < i:
                         prev_frame = proc_idx
                     elif proc_idx > i:
                         next_frame = proc_idx
                         break
-                
+
                 if prev_frame is not None and next_frame is not None:
                     prev_box, prev_helmet = frame_data[prev_frame]
                     next_box, next_helmet = frame_data[next_frame]
-                    
+
                     total_gap = next_frame - prev_frame
                     current_pos = i - prev_frame
                     factor = current_pos / total_gap if total_gap > 0 else 0
-                    
+
                     interpolated_box = self._interpolate_box(prev_box, next_box, factor)
-                    
+
                     nearest_helmet = prev_helmet if (i - prev_frame < next_frame - i) else next_helmet
-                    
+
                     interpolated_detections[i][track_id] = (interpolated_box, nearest_helmet)
-                
+
                 elif prev_frame is not None and prev_frame == max(frame_data.keys()):
                     if len(frame_data) >= 2:
                         sorted_frames = sorted(frame_data.keys())
@@ -255,7 +255,7 @@ class Interpolator:
                             prev_prev_frame = sorted_frames[-2]
                             prev_box, prev_helmet = frame_data[prev_frame]
                             prev_prev_box, _ = frame_data[prev_prev_frame]
-                            
+
                             frame_diff = prev_frame - prev_prev_frame
                             if frame_diff > 0:
                                 factor = (i - prev_frame) / frame_diff
@@ -267,18 +267,19 @@ class Interpolator:
                             interpolated_detections[i][track_id] = frame_data[prev_frame]
                     else:
                         interpolated_detections[i][track_id] = frame_data[prev_frame]
-            
+
         return interpolated_detections
-    
-    def _interpolate_box(self, box1: Tuple[int, int, int, int], box2: Tuple[int, int, int, int], factor: float) -> Tuple[int, int, int, int]:
+
+    def _interpolate_box(self, box1: Tuple[int, int, int, int], box2: Tuple[int, int, int, int], factor: float) -> \
+    Tuple[int, int, int, int]:
         x1_1, y1_1, x2_1, y2_1 = box1
         x1_2, y1_2, x2_2, y2_2 = box2
-        
+
         x1 = int(x1_1 + factor * (x1_2 - x1_1))
         y1 = int(y1_1 + factor * (y1_2 - y1_1))
         x2 = int(x2_1 + factor * (x2_2 - x2_1))
         y2 = int(y2_1 + factor * (y2_2 - y2_1))
-        
+
         return (x1, y1, x2, y2)
 
 
@@ -332,9 +333,9 @@ class DetectionSystem:
 
         if self.config.debug:
             print('============Raw Detections============')
-            print(person_boxes_per_index)     
+            print(person_boxes_per_index)
 
-        # get tracked detections
+            # get tracked detections
         tracks_per_index = {}
         for i in process_indices:
             tracks = self.tracker.update_tracks(person_boxes_per_index[i], frame=batch[i])
@@ -362,7 +363,8 @@ class DetectionSystem:
         helmet_results = self.helmet_model.model(crops, stream=False, verbose=False)
         helmet_flags = []
         for result in helmet_results:
-            helmet_flags.append(any(int(b.cls[0]) == 0 and float(b.conf[0]) > self.config.helmet_confidence for b in result.boxes))
+            helmet_flags.append(
+                any(int(b.cls[0]) == 0 and float(b.conf[0]) > self.config.helmet_confidence for b in result.boxes))
 
         # combine person segments and helmet results
         helmet_per_person = {}
@@ -404,12 +406,14 @@ class DetectionSystem:
 
                 if self.config.debug:
                     self.pose_model.draw_skeleton(person_crop, keypoints)
-                
-                state = self.pose_model.state(keypoints, prev_keypoints.get(track_id, np.empty(1, dtype=int)), prev_states.get(track_id, 'Idle'))
+
+                state = self.pose_model.state(keypoints, prev_keypoints.get(track_id, np.empty(1, dtype=int)),
+                                              prev_states.get(track_id, 'Idle'))
                 prev_keypoints[track_id] = keypoints
                 prev_states[track_id] = state
 
-                cv2.putText(frame, f'ID: {track_id} | {state}', (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cv2.putText(frame, f'ID: {track_id} | {state}', (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (255, 255, 0), 2)
 
             self.visualizer.draw_person_count(frame, person_count)
             processor.out.write(frame)
@@ -426,7 +430,7 @@ config = DetectionConfig(
     deepsort_max_age=90,
     deepsort_n_init=10,
     deepsort_confidence=0.6,
-    debug=True,
+    debug=False,
 )
 
 if __name__ == '__main__':
