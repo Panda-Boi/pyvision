@@ -1,5 +1,6 @@
 import time
-from typing import List, Tuple, Iterator, Dict
+import warnings
+from typing import List, Tuple, Iterator
 from dataclasses import dataclass
 
 import cv2
@@ -10,6 +11,9 @@ from ultralytics import YOLO
 
 import tensorflow as tf
 import tensorflow_hub as hub
+
+
+warnings.filterwarnings('ignore', module='tensorflow')
 
 
 @dataclass
@@ -31,17 +35,19 @@ class DetectionConfig:
 class BaseDetectionModel:
     def __init__(self, config: DetectionConfig):
         self.model = YOLO(config.base_model)
+        self.device = '0' if tf.config.list_physical_devices('GPU') else 'cpu'
 
     def detect(self, frames: List[np.ndarray]):
-        return self.model(frames, stream=False, verbose=False, device='0')
+        return self.model(frames, stream=False, verbose=False, device=self.device)
 
 
 class HelmetDetectionModel:
     def __init__(self, config: DetectionConfig):
         self.model = YOLO(config.helmet_model)
+        self.device = '0' if tf.config.list_physical_devices('GPU') else 'cpu'
 
     def detect(self, image: np.ndarray) -> bool:
-        result = self.model(image, stream=False, verbose=False, device='0')[0]
+        result = self.model(image, stream=False, verbose=False, device=self.device)[0]
         return any(int(b.cls[0]) == 0 and float(b.conf[0]) > config.helmet_confidence for b in result.boxes)
 
 
@@ -310,7 +316,8 @@ class DetectionSystem:
         print(f'FPS: {fps:.2f}')
 
     def _process_batch(self, batch: List[np.ndarray], process_indices: List[int], processor: VideoProcessor):
-        print(f'Processing {process_indices} indices out of batch of len {len(batch)}')
+        if self.config.debug:
+            print(f'Processing {process_indices} indices out of batch of len {len(batch)}')
 
         # get raw segmented detections
         results = self.person_model.detect([batch[i] for i in process_indices])
