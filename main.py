@@ -59,7 +59,6 @@ class PoseDetectionModel:
         self.movenet = self.tf_model.signatures['serving_default']
 
     def state(self, keypoints_now, keypoints_prev, prev_state):
-
         KEYPOINTS_THRESHOLD = 10
 
         if len(keypoints_now) < KEYPOINTS_THRESHOLD:
@@ -295,8 +294,7 @@ class DetectionSystem:
         self.frames = {}
 
     def process_video(self):
-        print(f'Device: {"cuda" if torch.cuda.is_available() else "cpu"}\n'
-              f'Input: {self.config.input_path}\n'
+        print(f'Input: {self.config.input_path}\n'
               f'Output: {self.config.output_path}')
 
         start_time = time.time()
