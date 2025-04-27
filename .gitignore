@@ -2,3 +2,5 @@ output*
 yolo*
 .venv/
 __pycache__/
+report/
+presentation/
